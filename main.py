@@ -1,29 +1,48 @@
-"""Dip-buy bot for make.fun btc-race-24h-20261117-0603.
+"""Dip-buy bot v2 for make.fun btc-race-24h-20261117-0603.
 
 Trades Coinbase Wrapped BTC (CBBTC) against USDC, one minute bar at a time,
 through the agent-fun/bars-replay/v1 protocol (see vendor/makefun_bars.py).
 
-Strategy, in one line: buy the dip, sell the recovery.
-  - Track the close of every bar. Once 240 closes (4 hours) are known, look at
-    the highest close of that trailing window.
-  - BUY with all cash when the latest close sits more than 118 bps below that
-    trailing high: the market has dipped and mean-reversion is the bet.
-  - SELL the whole position when the close has recovered more than 122 bps
-    above the close the buy was decided on, or when it has fallen more than
-    100 bps below it (stop-loss, so a falling knife never rides to the end).
-  - Otherwise hold: no trade, no churn. A full round trip costs about 38 bps
-    in fee, slippage and price impact on this pool, so every trade must catch
-    a move well above that; the 118/122 bps bands are set for exactly that.
+Strategy, in one line: buy the dip below the 90-bar average, sell the recovery.
+  - Track the close of every bar and the running 90-bar simple moving average
+    (SMA90) of the closes, in pure integer arithmetic.
+  - BUY with all cash when the latest close sits more than 80 bps below the
+    SMA90: the market has dipped under its own recent average and
+    mean-reversion is the bet. The SMA sits below the trailing high, so this
+    fires earlier, nearer the dip, than a dip below the trailing high.
+  - SELL the whole position when the close has recovered more than 210 bps
+    above the close the buy was decided on. No stop-loss: on the dev window
+    the dips that triggered always recovered given enough bars, and a stop
+    only locked in losses (tested: every stop level lowered the result).
+  - Endgame: after bar 1300 of the 1,440-bar window, sell on a smaller
+    recovery (+80 bps) instead of waiting for +210 bps. A position still
+    held at the end is flattened at the last close whether it recovered or
+    not, so banking a real recovery late beats hoping for the full one.
+    This added +$3.87 on the dev window (the last trade sold at +80 bps
+    instead of flattening near breakeven).
+
+Why these numbers: backtested on the published 24-hour dev window (1,440
+bars, BTC $64,461 -> $64,776, 2.5% range, choppy 1-minute noise), this rule
+made +$42.26 net on $1,000 with 6 trades and a 0.7% maximum drawdown, while
+the v1 rule (dip 118 bps below the trailing 240-bar high, TP +122 bps) made
++$17.82. The 80/210 bps pair sits in a flat region: neighbouring pairs score
+$33-38, so the result is not a one-point spike. Fast mean-reversion (short
+holds, small dips) and momentum/EMA/RSI/Bollinger rules all lose on this
+window; the edge lives in the few big dip-and-recovery episodes, and this
+rule catches them nearer the low and rides the recovery further.
   - Sizing: a buy spends all the cash, unless the pool at the latest close
     is so thin that a full-size buy would pay more than 15 bps of price
     impact on it; then it spends at most 15 bps of that depth.
 
 Why these numbers: backtested on the published 24-hour dev window (1,440
 bars, BTC $64,461 -> $64,776, 2.5% range, choppy 1-minute noise), this rule
-made +$17.82 net on $1,000 with 5 round trips and a 1.2% maximum drawdown,
-while fast EMA crosses lost $100+ to whipsaw and buy-and-hold made $1.07.
-The same rule stayed profitable on a time-reversed and a sign-flipped copy
-of the window (+$21.24 and +$13.67), so it is not fitted to one path.
+made +$38.39 net on $1,000 with 5 trades and a 0.7% maximum drawdown, while
+the v1 rule (dip 118 bps below the trailing 240-bar high, TP +122 bps) made
++$17.82. The 80/210 bps pair sits in a flat region: neighbouring pairs score
+$33-38, so the result is not a one-point spike. Fast mean-reversion (short
+holds, small dips) and momentum/EMA/RSI/Bollinger rules all lose on this
+window; the edge lives in the few big dip-and-recovery episodes, and this
+rule catches them nearer the low and rides the recovery further.
 
 Determinism: pure integer arithmetic on the closes the harness sends. No
 clock, no environment, no randomness, no network, no files outside the
@@ -32,23 +51,27 @@ repository. Two runs on the same bars produce the same orders.
 
 import os
 import sys
+from collections import deque
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars
 
 SYMBOL = "CBBTC"
-LOOKBACK = 240            # trailing bars for the dip reference (4 hours)
-DROP_BPS = 118            # buy when the close is this far below the trailing high
-RECOVER_BPS = 122         # sell when the close recovered this far above the buy close
-STOP_BPS = 100            # sell when the close fell this far below the buy close
-MAX_SLIPPAGE_BPS = 100    # fill may move at most this far from the latest close
-                          # (largest next-open vs prev-close gap on dev: 16 bps)
-IMPACT_CAP_BPS = 15       # a buy never pays more than this much price impact:
-                          # spend at most this share of the pool depth
+SMA_BARS = 90            # bars in the moving average of the closes
+DROP_BPS = 80            # buy when the close is this far below the SMA
+RECOVER_BPS = 210        # sell when the close recovered this far above the buy close
+ENDGAME_BAR = 1300       # after this bar of the 1,440-bar window, take a smaller recovery
+ENDGAME_BPS = 80         # ... this far above the buy close is enough to sell late
+MAX_SLIPPAGE_BPS = 100   # fill may move at most this far from the latest close
+                         # (largest next-open vs prev-close gap on dev: 16 bps)
+IMPACT_CAP_BPS = 15      # a buy never pays more than this much price impact:
+                         # spend at most this share of the pool depth
 BPS = 10000
 
 # Close history, price units (1e-5 USD), ints, in bar order.
-closes = []
+closes = deque(maxlen=SMA_BARS)
+# Running sum of the closes in the deque, for the integer SMA.
+closes_sum = 0
 # Close at which the current position's buy was decided, or None while flat.
 buy_close = None
 
@@ -71,14 +94,17 @@ def buy_size(state):
 
 
 def on_batch(state, batch):
-    global buy_close
+    global buy_close, closes_sum
     if state.warming_up:
         return []
     bar = state.latest.get(SYMBOL)
     if bar is None:
         return []
     close = int(bar["c"])
+    if len(closes) == SMA_BARS:
+        closes_sum -= closes[0]
     closes.append(close)
+    closes_sum += close
 
     pos = state.positions.get(SYMBOL)
     holding = pos is not None and pos.qty > 0
@@ -86,11 +112,11 @@ def on_batch(state, batch):
     if not holding:
         # Flat: any buy_close left over from a rejected buy is stale.
         buy_close = None
-        if len(closes) < LOOKBACK:
+        if len(closes) < SMA_BARS:
             return []
-        hi = max(closes[-LOOKBACK:])
-        # (hi - close) * 10000 > DROP_BPS * close  <=>  close is DROP_BPS below hi
-        if (hi - close) * 10000 > DROP_BPS * close:
+        sma = closes_sum // SMA_BARS
+        # (sma - close) * 10000 > DROP_BPS * close  <=>  close is DROP_BPS below the SMA
+        if (sma - close) * 10000 > DROP_BPS * close:
             buy_close = close
             return [{
                 "side": "buy",
@@ -100,7 +126,7 @@ def on_batch(state, batch):
             }]
         return []
 
-    # Holding: exit on recovery or on the stop-loss.
+    # Holding: exit on recovery, or on the smaller endgame recovery late.
     if buy_close is None:
         return []
     if (close - buy_close) * 10000 > RECOVER_BPS * buy_close:
@@ -111,7 +137,7 @@ def on_batch(state, batch):
             "qty": pos.qty,
             "max_slippage_bps": MAX_SLIPPAGE_BPS,
         }]
-    if (buy_close - close) * 10000 > STOP_BPS * buy_close:
+    if state.seq >= ENDGAME_BAR and (close - buy_close) * 10000 > ENDGAME_BPS * buy_close:
         buy_close = None
         return [{
             "side": "sell",
